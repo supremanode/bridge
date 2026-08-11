@@ -16,7 +16,7 @@
  * ponytail: /proc is the source of truth on Linux. No daemon, no socket, no
  * extension hook required. macOS fallback uses `ps` (less detail).
  */
-import { readFileSync, readlinkSync, statSync, readdirSync, existsSync } from "node:fs";
+import { readFileSync, readlinkSync, statSync, readdirSync, existsSync, openSync, readSync, closeSync, type Dirent } from "node:fs";
 import { execSync } from "node:child_process";
 import os, { homedir } from "node:os";
 import path, { join } from "node:path";
@@ -34,10 +34,12 @@ import { findSessionMeta } from "./historyLoader.js";
 function resolveLiveByCwd(cwd: string, runtime: string): { sessionId?: string; cwd: string; file?: string } | undefined {
   if (!cwd) return undefined;
   const home = homedir();
+  // Codex nests by date (YYYY/MM/DD), not by cwd, and the cwd lives in the
+  // session_meta first line — not the dir name. Needs a different walk.
+  if (runtime === "codex") return resolveCodexLive(cwd);
   const enc = cwd.replace(/\//g, "-"); // pi + claude both encode cwd as -home-jamezun-...
   let stores: string[] = [];
   if (runtime === "claude") stores = [join(home, ".claude", "projects")];
-  else if (runtime === "codex") stores = [join(home, ".codex", "sessions")];
   else stores = [join(home, ".pi", "agent", "sessions")]; // pi (default) + any pi-format
   let best: { file: string; mtime: number; sessionId?: string } | undefined;
   const RECENT_MS = 10 * 60_000; // live process appended within 10min
@@ -68,6 +70,56 @@ function resolveLiveByCwd(cwd: string, runtime: string): { sessionId?: string; c
     }
   }
   if (best) return { sessionId: best.sessionId, cwd, file: best.file };
+  return undefined;
+}
+
+/** Codex live-session resolver: codex nests sessions by date (YYYY/MM/DD) and
+ *  stores cwd in the session_meta first line, NOT in the dir name. So we walk
+ *  all recent .jsonl files, parse each one's session_meta header, and match the
+ *  cwd. Bounded by RECENT_MS (10min) + a file cap so a huge store can't stall. */
+function resolveCodexLive(targetCwd: string): { sessionId?: string; cwd: string; file?: string } | undefined {
+  const home = homedir();
+  const root = join(home, ".codex", "sessions");
+  if (!existsSync(root)) return undefined;
+  const RECENT_MS = 10 * 60_000;
+  const now = Date.now();
+  const files: string[] = [];
+  const walk = (dir: string, depth: number) => {
+    if (depth > 4 || files.length > 300) return;
+    let entries: Dirent[];
+    try { entries = readdirSync(dir, { withFileTypes: true }); }
+    catch { return; }
+    for (const e of entries) {
+      if (files.length > 300) break;
+      const fp = join(dir, e.name);
+      if (e.isDirectory()) walk(fp, depth + 1);
+      else if (e.name.endsWith(".jsonl")) files.push(fp);
+    }
+  };
+  walk(root, 0);
+
+  let best: { file: string; mtime: number; sessionId?: string } | undefined;
+  for (const fp of files) {
+    try {
+      const st = statSync(fp);
+      if (now - st.mtimeMs > RECENT_MS) continue; // dormant — skip
+      // Read first line for session_meta { payload: { session_id, cwd } }
+      const fd = openSync(fp, "r");
+      let metaCwd: string | undefined, metaId: string | undefined;
+      try {
+        const buf = Buffer.alloc(65536);
+        const n = readSync(fd, buf, 0, Math.min(65536, st.size), 0);
+        const firstLine = buf.toString("utf8", 0, n).split("\n")[0];
+        if (firstLine.trim().startsWith("{")) {
+          const m = JSON.parse(firstLine);
+          if (m.type === "session_meta" && m.payload) { metaCwd = m.payload.cwd; metaId = m.payload.session_id; }
+        }
+      } finally { closeSync(fd); }
+      if (metaCwd !== targetCwd || !metaId) continue;
+      if (!best || st.mtimeMs > best.mtime) best = { file: fp, mtime: st.mtimeMs, sessionId: metaId };
+    } catch { /* skip */ }
+  }
+  if (best) return { sessionId: best.sessionId, cwd: targetCwd, file: best.file };
   return undefined;
 }
 

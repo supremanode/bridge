@@ -14,13 +14,16 @@
  *              Name: {"type":"session_info","name":"<name>"} (latest wins)
  *   - Claude:  ~/.claude/projects/<encoded-cwd>/<uuid>.jsonl
  *              sessionId = filename. No name field — derive from first user msg.
- *   - Codex:   ~/.codex/sessions/ (stub — not installed locally to verify)
+ *   - Codex:   ~/.codex/sessions/YYYY/MM/DD/rollout-<ts>-<uuid>.jsonl (nested)
+ *              First line: {"type":"session_meta","payload":{"session_id":"<uuid>","cwd":"<path>"}}
+ *              Name: ~/.codex/session_index.jsonl → {"id":"<uuid>","thread_name":"<name>"}
+ *              Messages: {"type":"response_item","payload":{"role":"user|assistant","content":[...]}}
  *
  * Custom scan paths: add via Settings (stored on relay, fetched on poll) or
  * SESSION_SCAN_PATHS env (comma-separated). Each path is scanned as pi-format
  * (JSONL with session_info) — the most common pattern.
  */
-import { readFileSync, readdirSync, statSync, existsSync, openSync, fstatSync, readSync, closeSync } from "node:fs";
+import { readFileSync, readdirSync, statSync, existsSync, openSync, fstatSync, readSync, closeSync, type Dirent } from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import type { AgentSession } from "./sessionDiscovery.js";
@@ -82,7 +85,8 @@ export function scanNamedSessions(): AgentSession[] {
     if (!existsSync(dir)) continue;
     try {
       if (runtime === "claude") out.push(...scanClaude(dir));
-      else out.push(...scanPiFormat(dir, runtime)); // pi + codex + custom all use this format
+      else if (runtime === "codex") out.push(...scanCodex(dir));
+      else out.push(...scanPiFormat(dir, runtime)); // pi + custom use this format
     } catch { /* permission error etc — skip this root */ }
     if (out.length >= MAX_SESSIONS) break;
   }
@@ -223,15 +227,28 @@ function decodeClaudeCwdName(name: string): string {
   return name.slice(1).replace(/-/g, "/");
 }
 
-/** Derive a display name from the first real user message in a claude session. */
+/** Derive a display name from a claude session file.
+ * Priority: custom-title/agent-name (/rename) → first real user message. */
 function deriveClaudeName(fp: string): string | undefined {
-  // Read first ~5KB — the first user message is near the top. Skip system
-  // instructions (injected by harnesses like pi) which aren't human-authored.
+  // Read first ~16KB — /rename writes custom-title + agent-name near the top,
+  // before the first real user message. Skip system-injection caveats.
   const fd = require("node:fs").openSync(fp, "r");
-  const buf = Buffer.alloc(8192);
-  require("node:fs").readSync(fd, buf, 0, 8192, 0);
+  const buf = Buffer.alloc(16384);
+  require("node:fs").readSync(fd, buf, 0, 16384, 0);
   require("node:fs").closeSync(fd);
   const head = buf.toString("utf8");
+  let customName: string | undefined;
+  for (const line of head.split("\n")) {
+    if (!line.trim().startsWith("{")) continue;
+    try {
+      const entry = JSON.parse(line);
+      // /rename writes these — the authoritative name.
+      if (entry.type === "custom-title" && entry.customTitle?.trim()) { customName = entry.customTitle.trim(); break; }
+      if (!customName && entry.type === "agent-name" && entry.agentName?.trim()) customName = entry.agentName.trim();
+    } catch { /* skip */ }
+  }
+  if (customName) return customName;
+  // Fallback: first real user message (skip system-instruction injections).
   for (const line of head.split("\n")) {
     if (!line.trim().startsWith("{")) continue;
     try {
@@ -243,9 +260,8 @@ function deriveClaudeName(fp: string): string | undefined {
             ? entry.message.content.find((c: any) => c.type === "text")?.text
             : undefined;
         if (!content) continue;
-        // Skip system-instruction injections (pi/claude harness wrappers)
         if (/^\[System instructions\]/.test(content)) continue;
-        // First real user message → use as name
+        if (/^<local-command-caveat>/.test(content)) continue;
         return content.replace(/\n/g, " ").trim();
       }
     } catch { /* skip */ }
@@ -253,14 +269,83 @@ function deriveClaudeName(fp: string): string | undefined {
   return undefined;
 }
 
-/**
- * Look up the sessionId (UUID) for a named session — used to enrich live /proc
- * processes with their resumable session UUID. Only LIVE processes are surfaced
- * in the session list; this just resolves the name→UUID so messaging resumes
- * the right on-disk conversation. Returns the most recently modified match.
- *
- * Checks pi + claude stores + custom paths. Returns undefined if not found.
- */
+/** Codex CLI scanner: ~/.codex/sessions/YYYY/MM/DD/rollout-<ts>-<uuid>.jsonl (nested).
+ * Names live in a SEPARATE registry file (~/.codex/session_index.jsonl),
+ * not in the session files themselves. First line of each session file is
+ * {"type":"session_meta","payload":{"session_id":"<uuid>","cwd":"<path>"}}.
+ * Returns only NAMED sessions (those with a thread_name in the index). */
+function scanCodex(root: string): AgentSession[] {
+  const out: AgentSession[] = [];
+
+  // 1. Load the name registry: id → { thread_name, updated_at }
+  const nameMap = new Map<string, { name: string; updated: number }>();
+  const idxPath = path.join(path.dirname(root), "session_index.jsonl");
+  try {
+    const idx = readFileSync(idxPath, "utf8");
+    for (const line of idx.split("\n")) {
+      const t = line.trim();
+      if (!t.startsWith("{")) continue;
+      try {
+        const e = JSON.parse(t);
+        if (e.id && e.thread_name) nameMap.set(e.id, { name: e.thread_name, updated: Date.parse(e.updated_at) || 0 });
+      } catch { /* skip */ }
+    }
+  } catch { /* no index — all sessions unnamed, return empty */ }
+  if (nameMap.size === 0) return out;
+
+  // 2. Recursively find all .jsonl under root (nested YYYY/MM/DD).
+  const files: string[] = [];
+  const walk = (dir: string, depth: number) => {
+    if (depth > 4 || files.length >= MAX_SESSIONS * 3) return; // bound recursion
+    let entries: Dirent[];
+    try { entries = readdirSync(dir, { withFileTypes: true }); }
+    catch { return; }
+    for (const e of entries) {
+      if (files.length >= MAX_SESSIONS * 3) break;
+      const fp = path.join(dir, e.name);
+      if (e.isDirectory()) walk(fp, depth + 1);
+      else if (e.name.endsWith(".jsonl")) files.push(fp);
+    }
+  };
+  walk(root, 0);
+
+  // 3. Parse each: first line has session_meta with id + cwd; match name from index.
+  for (const fp of files) {
+    try {
+      const fd = openSync(fp, "r");
+      let sessionId: string | undefined, cwd: string | undefined;
+      try {
+        const headBuf = Buffer.alloc(65536);
+        const n = readSync(fd, headBuf, 0, Math.min(65536, fstatSync(fd).size), 0);
+        const firstLine = headBuf.toString("utf8", 0, n).split("\n")[0];
+        if (firstLine.trim().startsWith("{")) {
+          const meta = JSON.parse(firstLine);
+          if (meta.type === "session_meta" && meta.payload) {
+            sessionId = meta.payload.session_id;
+            cwd = meta.payload.cwd;
+          }
+        }
+      } finally { closeSync(fd); }
+      if (!sessionId) continue;
+      const named = nameMap.get(sessionId);
+      if (!named || !named.name.trim()) continue; // unnamed — skip
+      const st = statSync(fp);
+      out.push({
+        id: `codex-session-${sessionId.slice(0, 8)}`,
+        pid: 0,
+        runtime: "codex",
+        name: named.name.trim().slice(0, MAX_NAME_LEN),
+        cwd: cwd || "",
+        sessionId,
+        status: "online",
+        startedAt: named.updated || st.birthtimeMs || st.mtimeMs,
+        lastActivity: st.mtimeMs,
+      });
+    } catch { /* corrupt file — skip */ }
+  }
+  return out;
+}
+
 // name→sessionId resolution now delegates to historyLoader.findSessionMeta — the
 // SAME warmed index history reads use. The old version read each JSONL
 // head+tail, which missed mid-file renames (the index does a full async scan).
