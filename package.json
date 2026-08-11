@@ -1,0 +1,25 @@
+{
+  "name": "@supremanode/bridge",
+  "version": "0.0.10",
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "build": "tsc && node scripts/install-extension.mjs",
+    "start": "node dist/index.js",
+    "typecheck": "tsc --noEmit",
+    "postinstall": "node scripts/install-extension.mjs"
+  },
+  "dependencies": {
+    "undici": "^8.7.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/supremanode/bridge"
+  },
+  "license": "Apache-2.0"
+}
