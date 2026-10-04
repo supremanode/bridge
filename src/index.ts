@@ -88,6 +88,9 @@ const run = promisify(execFile);
 const RELAY_URL = flagRelay || process.env.RELAY_URL || "http://localhost:4000";
 const BRIDGE_ID = flagId || process.env.BRIDGE_ID || `bridge-${randomUUID().slice(0, 8)}`;
 const POLL_INTERVAL_MS = Number(process.env.POLL_INTERVAL_MS ?? 2000);
+// v3.30: long-poll hold (seconds). The relay holds the request until a task
+// exists (max 30s server-side). Legacy 2s polling = set 0.
+const POLL_WAIT_S = Number(process.env.BRIDGE_POLL_WAIT_S ?? 25);
 const HARNESS_FILTER = flagHarness || process.env.HARNESS || undefined; // restrict to one harness
 
 // Capability token issued by the relay on bridge registration. Sent as
@@ -368,7 +371,12 @@ async function pollInterrupts(): Promise<void> {
 }
 
 async function pollPending(): Promise<any | null> {
-  const url = `${RELAY_URL}/v1/pending-question${HARNESS_FILTER ? `?harness=${HARNESS_FILTER}` : ""}`;
+  // v3.30 long-poll: hold the request up to WAIT_S so the relay can return the
+  // INSTANT a task appears (and idle traffic drops ~12x). 0 = legacy instant poll.
+  const params: string[] = [];
+  if (HARNESS_FILTER) params.push(`harness=${encodeURIComponent(HARNESS_FILTER)}`);
+  if (POLL_WAIT_S > 0) params.push(`wait=${POLL_WAIT_S}`);
+  const url = `${RELAY_URL}/v1/pending-question${params.length ? `?${params.join("&")}` : ""}`;
   let r: Response;
   try {
     r = await relayFetch(url, { headers: authHeaders() });
@@ -607,16 +615,26 @@ async function main(): Promise<void> {
   if (capToken) console.log(`  bridge token: acquired (90d)`);
   else console.log(`  bridge token: none (soft mode — set BRIDGE_USER_TOKEN to register)`);
 
-  console.log(`▶ Suprema Bridge ${BRIDGE_ID} → ${RELAY_URL}  (poll every ${POLL_INTERVAL_MS}ms${HARNESS_FILTER ? `, harness=${HARNESS_FILTER}` : ""})`);
-  // poll loop
+  console.log(`▶ Suprema Bridge ${BRIDGE_ID} → ${RELAY_URL}  (${POLL_WAIT_S > 0 ? `long-poll ${POLL_WAIT_S}s` : `poll every ${POLL_INTERVAL_MS}ms`}${HARNESS_FILTER ? `, harness=${HARNESS_FILTER}` : ""})`);
+  // v3.30 poll loop — SEQUENTIAL self-scheduling, not setInterval: a 25s
+  // long-poll held open while setInterval keeps firing would stack parallel
+  // held connections (and the old 2s interval could double-claim while a
+  // task was still executing). One poll in flight at a time; short gap when
+  // long-polling, POLL_INTERVAL_MS gap in legacy mode; 3s backoff on errors
+  // so a relay restart doesn't get hammered.
   let firstPoll = true;
-  setInterval(async () => {
-    try {
-      if (firstPoll) { console.log(`[bridge] first poll to ${RELAY_URL}/v1/pending-question`); firstPoll = false; }
-      await tick();
+  (async function pollLoop(): Promise<void> {
+    for (;;) {
+      try {
+        if (firstPoll) { console.log(`[bridge] first poll to ${RELAY_URL}/v1/pending-question`); firstPoll = false; }
+        await tick();
+        await new Promise((r) => setTimeout(r, POLL_WAIT_S > 0 ? 250 : POLL_INTERVAL_MS));
+      } catch (e) {
+        console.error("[tick]", e instanceof Error ? e.message : e);
+        await new Promise((r) => setTimeout(r, 3_000));
+      }
     }
-    catch (e) { console.error("[tick]", e instanceof Error ? e.message : e); }
-  }, POLL_INTERVAL_MS);
+  })();
   // session-push loop — full session list every 10s (off the poll header to
   // stay under Cloudflare's header size limit).
   pushSessions().catch(() => {});
